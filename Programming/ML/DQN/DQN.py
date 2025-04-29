@@ -338,7 +338,7 @@ GAMMA = 0.9 # the priority placed on future rewards
 BATCH_SIZE = 32
 INIT_BUFFER_SIZE = int(10000 / 2) # number of experiences to fill the buffer with initially
 MAX_BUFFER_SIZE = 10000 # the maximum number of experiences the buffer can hold
-MODEL_NAME = 'DQN_breakout'
+MODEL_NAME = 'DQN_mountaincar'
 
 # filling the replay buffer and validation set
 print('Filling replay buffer and validation set...')
