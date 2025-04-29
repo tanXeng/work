@@ -6,11 +6,14 @@ import gym
 import cv2
 from torch.utils.data import Dataset, DataLoader, RandomSampler
 from torch.optim import AdamW
+np.bool8 = np.bool_ 
 
-env = gym.make("CartPole-v1", render_mode="rgb_array")
+GAME = 'MountainCar-v0'
+
+env = gym.make(GAME, render_mode='rgb_array')
 
 # creating a seperate env for visualization
-env_human = gym.make("CartPole-v1", render_mode="human")
+env_human = gym.make(GAME, render_mode='human')
 
 obs = env.reset()
 obs_human = env_human.reset()
@@ -20,6 +23,8 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'Using {device} device')
 
 # -------------------------------------Model------------------------------------- #
+
+NUM_ACTIONS = 3
 
 class DQN(nn.Module):
     def __init__(self):
@@ -31,7 +36,7 @@ class DQN(nn.Module):
         self.conv2 = nn.Conv2d(6, 16, 7)
         self.fc1 = nn.Linear(16 * 16 * 16, 120)
         self.fc2 = nn.Linear(120, 84)
-        self.fc3 = nn.Linear(84, 2) # cart pole has 2 possible actions per state
+        self.fc3 = nn.Linear(84, NUM_ACTIONS) # cart pole has 2 possible actions per state
 
     def forward(self, x):
         x = self.pool(F.leaky_relu(self.conv1(x)))
@@ -61,11 +66,11 @@ class DQNDataset(Dataset):
 
     def __getitem__(self, idx):
         state, action, reward, next_state, done = self.replay_buffer[idx]
-        return state, \
-               torch.tensor(action, dtype=torch.int64), \
-               torch.tensor(reward, dtype=torch.float32), \
-               next_state, \
-               torch.tensor(done, dtype=torch.int64)
+        return state.cpu(), \
+               torch.tensor(action, dtype=torch.int64).cpu(), \
+               torch.tensor(reward, dtype=torch.float32).cpu(), \
+               next_state.cpu(), \
+               torch.tensor(done, dtype=torch.int64).cpu()
 
 def preprocess_frame(frame):
     
@@ -131,8 +136,12 @@ def collect_experience(env, epsilon, env_human=None):
     if rand_num < epsilon:
         action = env.action_space.sample()
     else:
-        action = np.argmax(Q_prediction) 
+        action = torch.argmax(Q_prediction) 
 
+    # converting action to an int to pass into env.step()
+    action = int(action) 
+
+    # taking the step
     obs, reward, terminated, truncated, info = env.step(action)
     if env_human:
         env_human.step(action)
@@ -260,6 +269,60 @@ def sgd_step(batch, target_Q, device):
     
     return loss.item()
 
+def prepare_val_set(val_set_size, env):
+
+    """
+    Prepares the validation dataset by filling the replay buffer with initial experiences.
+
+    Args:
+        val_set_size (int): The number of experiences to collect for validation
+        env (gym.Env): The environment instance in rgb mode.
+
+    Returns:
+        DQNDataset: the dataset containing the experiences for validation
+    """
+
+    # reusing fill_replay_buffer
+    val_list = fill_replay_buffer(val_set_size, env, 0)
+   
+    return DQNDataset(val_list)
+
+def validate(val_dataloader):
+
+    """
+    Compute the average Q-value of the validation set.
+
+    Args:
+        val_dataloader (torch.utils.data.DataLoader): The DataLoader object providing the validation set in batches.
+
+    Returns:
+        float: The average Q-value across the validation set.
+    """
+
+    total_max_Q = 0
+    for batch_idx, batch in enumerate(val_dataloader):
+        
+        # unpacking the experiences
+        states, actions, rewards, next_states, done = batch
+
+        # moving states to device
+        states = states.to(device)
+
+        # obtaining Q values
+        Q_values_batch = compute_Q(states, online_NN)
+
+        # obtaining the max Q
+        max_Q = Q_values_batch.max(dim=1).values 
+
+        # add the sum of the batch Q values to total_Q
+        total_max_Q += max_Q.sum().item()
+
+    # recovering val_set_size
+    val_set_size = len(val_dataloader.dataset)
+
+    return total_max_Q / val_set_size 
+
+
 # ------------------------------------Training------------------------------------ #
 
 M = 10000 # the total number of episodes
@@ -267,6 +330,7 @@ T = 10000 # the maximum number of actions per episode
 N = 4 # number of experiences to collect before performing SGD
 C = 100 # the number of weight updates between updating the target NN
 UPDATES_BETWEEN_VAL = 1000 # the number of weight updates between model validation
+VAL_SET_SIZE = 10000 # the size of the validation set
 EPSILON = 1 # the proability that a random move will be selected
 MIN_EPSILON = 0.1 # the minimum epsilon attainable
 EPSILON_DECAY_RATE = EPSILON / M # how much epsilon is reduced per episode
@@ -274,16 +338,25 @@ GAMMA = 0.9 # the priority placed on future rewards
 BATCH_SIZE = 32
 INIT_BUFFER_SIZE = int(10000 / 2) # number of experiences to fill the buffer with initially
 MAX_BUFFER_SIZE = 10000 # the maximum number of experiences the buffer can hold
+MODEL_NAME = 'DQN_breakout'
 
-# filling the replay buffer
-print('Filling replay buffer...')
+# filling the replay buffer and validation set
+print('Filling replay buffer and validation set...')
 replay_buffer = fill_replay_buffer(INIT_BUFFER_SIZE, env, EPSILON)
+val_set = prepare_val_set(VAL_SET_SIZE, env)
+val_set_dataloader = DataLoader(val_set, batch_size=BATCH_SIZE)
 
-# initialising num_updates to keep track of the number of times the model weights are updated
+# initializing num_updates to keep track of the number of times the model weights are updated
 num_updates = 0
 
 print('Starting training...')
 for episode_number in range(M):
+
+    # resetting the start_new_ep flag
+    start_new_ep = False
+
+    if (episode_number + 1) % 100 == 0:
+        print(f'     Episode {episode_number + 1}: ')
     
     # reseting the environment at the start of each episode
     env.reset()
@@ -302,9 +375,14 @@ for episode_number in range(M):
 
             # ending the episode if the new state is terminal
             if experience[-1] == 1:
-                print('     Terminal state reached. Starting a new Episode...')
+                # print('     Terminal state reached. Starting a new episode...')
+                start_new_ep = True
                 break
-            
+
+        # start a new episode if the flag is set
+        if start_new_ep:
+            break  
+
         # adding N new experiences to the buffer
         replay_buffer.extend(new_experiences)
 
@@ -332,8 +410,10 @@ for episode_number in range(M):
         num_updates += 1
 
         # validating
-        # if num_updates % STEPS_BETWEEN_VAL == 0:
-        #     print('Validating...')
+        if num_updates % UPDATES_BETWEEN_VAL == 0:
+            print('Validating...')
+            avg_Q = validate(val_set_dataloader)
+            print(f'     Average Q of the validation set: {avg_Q}')
 
         # updating target_NN weights
         if num_updates % C == 0:
@@ -342,13 +422,10 @@ for episode_number in range(M):
         # reducing EPSILON as training progresses
         EPSILON = max(MIN_EPSILON, EPSILON - EPSILON_DECAY_RATE * episode_number)
 
-        if (episode_number + 1) % 100 == 0:
-            print(f'     Episode {episode_number + 1} completed')
-
 # saving the model weights
 torch.save({'model_state_dict': online_NN.state_dict(),
             'optimizer_state_dict': optimizer.state_dict()},
-            f"Users\\tanxe\\Programming\\ML\\DQN\\models\\DQN_cartpole.pt")
+            f"/Users/tanxe/Programming/ML/DQN/models/{MODEL_NAME}.pt")
     
 env.close()
 env_human.close()
